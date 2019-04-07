@@ -54,6 +54,8 @@ struct simplefs_inode {
 	};
 };
 
+#define SIMPLEFS_MAX_DIR_RECORD_COUNT (SIMPLEFS_DEFAULT_BLOCK_SIZE/sizeof(struct simplefs_dir_record))
+
 const int SIMPLEFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED = 64;
 /* min (
 		SIMPLEFS_DEFAULT_BLOCK_SIZE / sizeof(struct simplefs_inode),
@@ -69,9 +71,9 @@ struct simplefs_super_block {
 	uint64_t block_size;
 
 	/* FIXME: This should be moved to the inode store and not part of the sb */
+	uint64_t inodes_table;
 	uint64_t inodes_count;
-
 	uint64_t free_blocks;
 
-	char padding[SIMPLEFS_DEFAULT_BLOCK_SIZE - (5 * sizeof(uint64_t))];
+	char padding[SIMPLEFS_DEFAULT_BLOCK_SIZE - (6 * sizeof(uint64_t))];
 };

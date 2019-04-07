@@ -16,8 +16,8 @@
 #include <linux/version.h>
 
 #include "super.h"
-
 #define f_dentry f_path.dentry
+
 /* A super block lock that must be used for any critical section operation on the sb,
  * such as: updating the free_blocks, inodes_count etc. */
 static DEFINE_MUTEX(simplefs_sb_lock);
@@ -48,22 +48,42 @@ void simplefs_sb_sync(struct super_block *vsb)
 	brelse(bh);
 }
 
-struct simplefs_inode *simplefs_inode_search(struct super_block *sb,
+struct simplefs_inode *simplefs_inode_search(struct super_block *vsb,
 		struct simplefs_inode *start,
 		struct simplefs_inode *search)
 {
-	uint64_t count = 0;
-	while (start->inode_no != search->inode_no
-			&& count < SIMPLEFS_SB(sb)->inodes_count) {
-		count++;
-		start++;
-	}
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
 
-	if (start->inode_no == search->inode_no) {
+	start += (search->inode_no - 1);
+	if(((1<<(search->inode_no - 1)) & sb->inodes_table) && start->inode_no == search->inode_no)
+	{
 		return start;
 	}
 
 	return NULL;
+}
+
+void simplefs_inode_del(struct super_block *vsb, struct simplefs_inode *inode)
+{
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+
+	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
+		sfs_trace("Failed to acquire mutex lock\n");
+		return;
+	}
+
+	if (mutex_lock_interruptible(&simplefs_sb_lock)) {
+		sfs_trace("Failed to acquire mutex lock\n");
+		return;
+	}
+
+	sb->inodes_count--;
+	sb->inodes_table &= ~(1<<(inode->inode_no - 1));
+
+	simplefs_sb_sync(vsb);
+
+	mutex_unlock(&simplefs_sb_lock);
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
 }
 
 void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
@@ -87,18 +107,56 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
 		return;
 	}
 
-	/* Append the new inode in the end in the inode store */
-	inode_iterator += sb->inodes_count;
+	/* Append the new inode in the inode store by inode id */
+	inode_iterator += (inode->inode_no - 1);
 
 	memcpy(inode_iterator, inode, sizeof(struct simplefs_inode));
 	sb->inodes_count++;
-
+	sb->inodes_table |= (1<<(inode->inode_no - 1));
+	printk(KERN_INFO "inode_no=%llu, inodes_table=%llx, inodes_count=%%lu\n", inode->inode_no,
+			sb->inodes_table, sb->inodes_count);
 	mark_buffer_dirty(bh);
 	simplefs_sb_sync(vsb);
 	brelse(bh);
 
 	mutex_unlock(&simplefs_sb_lock);
 	mutex_unlock(&simplefs_inodes_mgmt_lock);
+}
+
+int simplefs_sb_release_a_datablock(struct super_block *vsb, uint64_t datablock_no)
+{
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	int ret = 0;
+
+	if (mutex_lock_interruptible(&simplefs_sb_lock)) {
+		sfs_trace("Failed to acquire mutex lock\n");
+		ret = -EINTR;
+		goto end;
+	}
+
+	/* Set the identified block from the free list */
+	sb->free_blocks |= (1 << datablock_no);
+
+	simplefs_sb_sync(vsb);
+
+end:
+	mutex_unlock(&simplefs_sb_lock);
+	return ret;
+}
+
+static void simplefs_clear_datablock(struct super_block *vsb, uint64_t datablock_no)
+{
+	struct buffer_head *bh;
+	char *data;
+	bh = sb_bread(vsb, datablock_no);
+	BUG_ON(!bh);
+
+	data = (char *)bh->b_data;
+	memset(data, 0, SIMPLEFS_DEFAULT_BLOCK_SIZE);
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
 }
 
 /* This function returns a blocknumber which is free.
@@ -109,7 +167,7 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
  *
  * If for some reason, the file creation/deletion failed, the block number
  * will still be marked as non-free. You need fsck to fix this.*/
-int simplefs_sb_get_a_freeblock(struct super_block *vsb, uint64_t * out)
+int simplefs_sb_get_a_freeblock(struct super_block *vsb, uint64_t * out, int isclear)
 {
 	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
 	int i;
@@ -136,6 +194,8 @@ int simplefs_sb_get_a_freeblock(struct super_block *vsb, uint64_t * out)
 	}
 
 	*out = i;
+	if(isclear)
+		simplefs_clear_datablock(vsb, i);
 
 	/* Remove the identified block from the free list */
 	sb->free_blocks &= ~(1 << i);
@@ -148,8 +208,9 @@ end:
 }
 
 static int simplefs_sb_get_objects_count(struct super_block *vsb,
-					 uint64_t * out)
+					 uint64_t * out, uint64_t *next_inode_no)
 {
+	uint64_t i;
 	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
 
 	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
@@ -157,6 +218,16 @@ static int simplefs_sb_get_objects_count(struct super_block *vsb,
 		return -EINTR;
 	}
 	*out = sb->inodes_count;
+	*next_inode_no = SIMPLEFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED + 1;
+	//skip 1 root inode
+	for(i=1; i<SIMPLEFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED; i++)
+	{
+		if(!((1<<i) & sb->inodes_table))
+		{
+			*next_inode_no = i + 1;
+			break;
+		}
+	}
 	mutex_unlock(&simplefs_inodes_mgmt_lock);
 
 	return 0;
@@ -176,6 +247,7 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 	struct simplefs_dir_record *record;
 	int i;
 
+	printk(KERN_INFO "TYQ: simplefs_iterate %s\n", filp->f_dentry->d_name.name);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
 	pos = ctx->pos;
 #else
@@ -232,7 +304,6 @@ struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 	struct simplefs_inode *sfs_inode = NULL;
 	struct simplefs_inode *inode_buffer = NULL;
 
-	int i;
 	struct buffer_head *bh;
 
 	/* The inode store can be read once and kept in memory permanently while mounting.
@@ -250,15 +321,14 @@ struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 		return NULL;
 	}
 #endif
-	for (i = 0; i < sfs_sb->inodes_count; i++) {
-		if (sfs_inode->inode_no == inode_no) {
-			inode_buffer = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
-			memcpy(inode_buffer, sfs_inode, sizeof(*inode_buffer));
 
-			break;
-		}
-		sfs_inode++;
+	sfs_inode += (inode_no - 1);
+	if(((1<<(inode_no - 1)) & sfs_sb->inodes_table) && sfs_inode->inode_no == inode_no)
+	{
+		inode_buffer = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
+		memcpy(inode_buffer, sfs_inode, sizeof(*inode_buffer));
 	}
+
 //      mutex_unlock(&simplefs_inodes_mgmt_lock);
 
 	brelse(bh);
@@ -277,6 +347,8 @@ ssize_t simplefs_read(struct file * filp, char __user * buf, size_t len,
 
 	char *buffer;
 	int nbytes;
+
+	printk(KERN_INFO "TYQ: simplefs_read %s\n", filp->f_path.dentry->d_name.name);
 
 	if (*ppos >= inode->file_size) {
 		/* Read request with offset beyond the filesize */
@@ -364,10 +436,12 @@ ssize_t simplefs_write(struct file * filp, const char __user * buf, size_t len,
 
 	int retval;
 
-	retval = generic_write_checks(filp, ppos, &len, 0);
-	if (retval) {
-		return retval;
-	}
+	printk(KERN_INFO "TYQ: simplefs_write %s\n", filp->f_path.dentry->d_name.name);
+	//TODO: replace generic write checks
+//	retval = generic_write_checks(filp, ppos, &len, 0);
+//	if (retval) {
+//		return retval;
+//	}
 
 	inode = filp->f_path.dentry->d_inode;
 	sfs_inode = SIMPLEFS_INODE(inode);
@@ -432,6 +506,12 @@ const struct file_operations simplefs_dir_operations = {
 #endif
 };
 
+static int simplefs_unlink(struct inode * dir, struct dentry *dentry);
+static int simplefs_rmdir (struct inode * dir, struct dentry *dentry);
+static int simplefs_link (struct dentry * old_dentry, struct inode * dir,
+				struct dentry *dentry);
+static int simplefs_symlink (struct inode * dir, struct dentry * dentry,
+				const char * symname);
 struct dentry *simplefs_lookup(struct inode *parent_inode,
 			       struct dentry *child_dentry, unsigned int flags);
 
@@ -441,14 +521,30 @@ static int simplefs_create(struct inode *dir, struct dentry *dentry,
 static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 			  umode_t mode);
 
-static struct inode_operations simplefs_inode_ops = {
+static const char *simplefs_get_link(struct dentry *, struct inode *, struct delayed_call *);
+
+static struct inode_operations simplefs_file_inode_ops = {
+//		.link = simplefs_link,
+//		.unlink = simplefs_unlink,
+//		.symlink = simplefs_symlink,
+};
+
+static struct inode_operations simplefs_dir_inode_ops = {
 	.create = simplefs_create,
+	.link = simplefs_link,
+	.unlink = simplefs_unlink,
+	.symlink = simplefs_symlink,
+	.rmdir = simplefs_rmdir,
 	.lookup = simplefs_lookup,
 	.mkdir = simplefs_mkdir,
 };
 
+static struct inode_operations simplefs_link_inode_ops = {
+		.get_link = simplefs_get_link,
+};
+
 static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
-				     umode_t mode)
+				     umode_t mode, struct inode **out)
 {
 	struct inode *inode;
 	struct simplefs_inode *sfs_inode;
@@ -457,7 +553,10 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	struct buffer_head *bh;
 	struct simplefs_dir_record *dir_contents_datablock;
 	uint64_t count;
+	uint64_t next_inode_no;
 	int ret;
+	int i;
+	int isclear_data;
 
 	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
 		sfs_trace("Failed to acquire mutex lock\n");
@@ -465,13 +564,14 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	}
 	sb = dir->i_sb;
 
-	ret = simplefs_sb_get_objects_count(sb, &count);
+	ret = simplefs_sb_get_objects_count(sb, &count, &next_inode_no);
 	if (ret < 0) {
 		mutex_unlock(&simplefs_directory_children_update_lock);
 		return ret;
 	}
 
-	if (unlikely(count >= SIMPLEFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED)) {
+	if (unlikely(count >= SIMPLEFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED
+			|| next_inode_no > SIMPLEFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED)) {
 		/* The above condition can be just == insted of the >= */
 		printk(KERN_ERR
 		       "Maximum number of objects supported by simplefs is already reached");
@@ -479,7 +579,7 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 		return -ENOSPC;
 	}
 
-	if (!S_ISDIR(mode) && !S_ISREG(mode)) {
+	if (!S_ISDIR(mode) && !S_ISREG(mode) && !S_ISLNK(mode)) {
 		printk(KERN_ERR
 		       "Creation request but for neither a file nor a directory");
 		mutex_unlock(&simplefs_directory_children_update_lock);
@@ -493,23 +593,34 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	}
 
 	inode->i_sb = sb;
-	inode->i_op = &simplefs_inode_ops;
-	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-	inode->i_ino = (count + SIMPLEFS_START_INO - SIMPLEFS_RESERVED_INODES + 1);
+	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
+	inode->i_ino = next_inode_no;
+			//(count + SIMPLEFS_START_INO - SIMPLEFS_RESERVED_INODES + 1);
 
 	sfs_inode = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
 	sfs_inode->inode_no = inode->i_ino;
 	inode->i_private = sfs_inode;
 	sfs_inode->mode = mode;
 
+	isclear_data = 0;
 	if (S_ISDIR(mode)) {
 		printk(KERN_INFO "New directory creation request\n");
 		sfs_inode->dir_children_count = 0;
 		inode->i_fop = &simplefs_dir_operations;
+		inode->i_op = &simplefs_dir_inode_ops;
+		isclear_data = 1;
 	} else if (S_ISREG(mode)) {
 		printk(KERN_INFO "New file creation request\n");
 		sfs_inode->file_size = 0;
 		inode->i_fop = &simplefs_file_operations;
+		inode->i_op = &simplefs_file_inode_ops;
+	}
+	else if(S_ISLNK(mode))
+	{
+		printk(KERN_INFO "New link creation request\n");
+		sfs_inode->file_size = 0;
+		inode->i_fop = NULL;
+		inode->i_op = &simplefs_link_inode_ops;
 	}
 
 	/* First get a free block and update the free map,
@@ -519,7 +630,7 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	 * The above ordering helps us to maintain fs consistency
 	 * even in most crashes
 	 */
-	ret = simplefs_sb_get_a_freeblock(sb, &sfs_inode->data_block_number);
+	ret = simplefs_sb_get_a_freeblock(sb, &sfs_inode->data_block_number, isclear_data);
 	if (ret < 0) {
 		printk(KERN_ERR "simplefs could not get a freeblock");
 		mutex_unlock(&simplefs_directory_children_update_lock);
@@ -535,7 +646,22 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
 
 	/* Navigate to the last record in the directory contents */
-	dir_contents_datablock += parent_dir_inode->dir_children_count;
+	for(i=0; i<SIMPLEFS_MAX_DIR_RECORD_COUNT; i++)
+	{
+		if(dir_contents_datablock->inode_no == 0)
+		{
+			break;
+		}
+		dir_contents_datablock++;
+	}
+
+	if(i == SIMPLEFS_MAX_DIR_RECORD_COUNT)
+	{
+		printk(KERN_ERR
+				"Maximum number of dir record supported by simplefs is already reached");
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		return -ENOSPC;
+	}
 
 	dir_contents_datablock->inode_no = sfs_inode->inode_no;
 	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
@@ -568,6 +694,238 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	inode_init_owner(inode, dir, mode);
 	d_add(dentry, inode);
 
+	if(out)
+		*out = inode;
+
+	return 0;
+}
+
+static int simplefs_remove_fs_object(struct inode *parent_dir, struct dentry *dentry)
+{
+	struct inode *inode;
+	struct simplefs_inode *sfs_inode;
+	struct super_block *sb;
+	struct simplefs_inode *parent_dir_inode;
+	struct buffer_head *bh;
+	struct simplefs_dir_record *dir_contents_datablock;
+	int i;
+	int ret;
+
+	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
+		sfs_trace("Failed to acquire mutex lock\n");
+		return -EINTR;
+	}
+	sb = parent_dir->i_sb;
+	inode = dentry->d_inode;
+	sfs_inode = SIMPLEFS_INODE(dentry->d_inode);
+
+	/* Remove data block */
+	ret = simplefs_sb_release_a_datablock(sb, sfs_inode->data_block_number);
+	if (ret < 0) {
+		printk(KERN_ERR "simplefs could not release datablock");
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		return ret;
+	}
+
+	/* Release inode from inode table */
+	simplefs_inode_del(sb, sfs_inode);
+
+	/* Remove from parent dir data block */
+	parent_dir_inode = SIMPLEFS_INODE(parent_dir);
+	bh = sb_bread(sb, parent_dir_inode->data_block_number);
+	BUG_ON(!bh);
+
+	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
+	for(i=0; i<SIMPLEFS_MAX_DIR_RECORD_COUNT; i++)
+	{
+		if(dir_contents_datablock->inode_no == sfs_inode->inode_no)
+		{
+			dir_contents_datablock->inode_no = 0;
+			break;
+		}
+		dir_contents_datablock++;
+	}
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		sfs_trace("Failed to acquire mutex lock\n");
+		return -EINTR;
+	}
+
+	/* Reduce the children count from parent dir  */
+	parent_dir_inode->dir_children_count--;
+	ret = simplefs_inode_save(sb, parent_dir_inode);
+	if (ret) {
+		mutex_unlock(&simplefs_inodes_mgmt_lock);
+		mutex_unlock(&simplefs_directory_children_update_lock);
+
+		/* TODO: Remove the newly created inode from the disk and in-memory inode store
+		 * and also update the superblock, freemaps etc. to reflect the same.
+		 * Basically, Undo all actions done during this create call */
+		return ret;
+	}
+
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+	mutex_unlock(&simplefs_directory_children_update_lock);
+
+	inode_dec_link_count(inode);
+
+	return 0;
+}
+
+static int simplefs_unlink(struct inode * parent_dir, struct dentry *dentry)
+{
+	printk(KERN_INFO "TYQ: simplefs_unlink parent dir inode=%lu, name=%s\n", parent_dir->i_ino, dentry->d_name.name);
+	return simplefs_remove_fs_object(parent_dir, dentry);
+}
+
+static int simplefs_rmdir (struct inode * parent_dir, struct dentry *dentry)
+{
+	printk(KERN_INFO "TYQ: simplefs_rmdir inode=%lu, name=%s\n", parent_dir->i_ino, dentry->d_name.name);
+	struct simplefs_inode *sfs_inode;
+	sfs_inode = SIMPLEFS_INODE(dentry->d_inode);
+	if(sfs_inode->dir_children_count > 0)
+		return -ENOTEMPTY;
+
+	return simplefs_remove_fs_object(parent_dir, dentry);
+}
+
+static const char *simplefs_get_link(struct dentry *dentry, struct inode *inode,
+			    struct delayed_call *done)
+{
+	printk(KERN_INFO "TYQ: simplefs_get_link inode=%lu\n", inode->i_ino);
+
+	char *target_path = NULL;
+	struct buffer_head *bh;
+	struct simplefs_inode *sfs_inode;
+	char *buffer;
+
+	sfs_inode = SIMPLEFS_INODE(inode);
+	bh = sb_bread(inode->i_sb, sfs_inode->data_block_number);
+	if (!bh)
+	{
+		printk(KERN_ERR "Reading the block number [%llu] failed.",
+				sfs_inode->data_block_number);
+		return ERR_PTR(-EINVAL);
+	}
+
+	buffer = (char *)bh->b_data;
+	printk(KERN_INFO "get symlink path is %s, %d\n", buffer, strlen(buffer)+1);
+	target_path = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if(target_path == NULL)
+	{
+		brelse(bh);
+		return ERR_PTR(-ENOMEM);
+	}
+	strcpy(target_path, buffer);
+
+	brelse(bh);
+	set_delayed_call(done, kfree_link, target_path);
+	return target_path;
+}
+
+static int simplefs_link (struct dentry * old_dentry, struct inode * dir,
+				struct dentry *dentry)
+{
+	printk(KERN_INFO "TYQ: simplefs_link inode=%lu, oldname=%s, name=%s\n",
+			dir->i_ino, old_dentry->d_name.name, dentry->d_name.name);
+	struct inode *inode = d_inode(old_dentry);
+	struct super_block *sb;
+	struct simplefs_inode *parent_dir_inode;
+	int err;
+	struct buffer_head *bh;
+	struct simplefs_dir_record *dir_contents_datablock;
+
+	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
+		sfs_trace("Failed to acquire mutex lock\n");
+		return -EINTR;
+	}
+	sb = dir->i_sb;
+
+	inode->i_ctime = current_time(inode);
+	inode_inc_link_count(inode);
+	ihold(inode);
+
+	parent_dir_inode = SIMPLEFS_INODE(dir);
+	bh = sb_bread(sb, parent_dir_inode->data_block_number);
+	BUG_ON(!bh);
+
+	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
+
+	/* Navigate to the last record in the directory contents */
+	dir_contents_datablock += parent_dir_inode->dir_children_count;
+
+	dir_contents_datablock->inode_no = inode->i_ino;
+	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		sfs_trace("Failed to acquire mutex lock\n");
+		return -EINTR;
+	}
+
+	parent_dir_inode->dir_children_count++;
+	err = simplefs_inode_save(sb, parent_dir_inode);
+	if (err) {
+		mutex_unlock(&simplefs_inodes_mgmt_lock);
+		mutex_unlock(&simplefs_directory_children_update_lock);
+
+		/* TODO: Remove the newly created inode from the disk and in-memory inode store
+		 * and also update the superblock, freemaps etc. to reflect the same.
+		 * Basically, Undo all actions done during this create call */
+		return err;
+	}
+
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+	mutex_unlock(&simplefs_directory_children_update_lock);
+	if (!err) {
+		d_instantiate(dentry, inode);
+		return 0;
+	}
+	inode_dec_link_count(inode);
+	iput(inode);
+	return err;
+}
+
+static int simplefs_symlink (struct inode * dir, struct dentry * dentry,
+				const char * symname)
+{
+	int ret;
+	struct inode *inode = NULL;
+	struct simplefs_inode *sfs_inode;
+	struct super_block *sb;
+	struct buffer_head *bh;
+	char *buffer;
+
+	printk(KERN_INFO "TYQ: simplefs_symlink inode=%lu, name=%s, symname=%s\n",
+				dir->i_ino, dentry->d_name.name, symname);
+	if(ret = simplefs_create_fs_object(dir, dentry, S_IFLNK | S_IRWXUGO, &inode))
+		return ret;
+
+	sfs_inode = SIMPLEFS_INODE(inode);
+	sb = inode->i_sb;
+	bh = sb_bread(sb, sfs_inode->data_block_number);
+	if (!bh)
+	{
+		printk(KERN_ERR "Reading the block number [%llu] failed.",
+				sfs_inode->data_block_number);
+		return 0;
+	}
+
+	buffer = (char *)bh->b_data;
+	strcpy(buffer, symname);
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
 	return 0;
 }
 
@@ -576,13 +934,15 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 {
 	/* I believe this is a bug in the kernel, for some reason, the mkdir callback
 	 * does not get the S_IFDIR flag set. Even ext2 sets is explicitly */
-	return simplefs_create_fs_object(dir, dentry, S_IFDIR | mode);
+	printk(KERN_INFO "TYQ: simplefs_mkdir parent dir inode=%lu, name=%s\n", dir->i_ino, dentry->d_name.name);
+	return simplefs_create_fs_object(dir, dentry, S_IFDIR | mode, NULL);
 }
 
 static int simplefs_create(struct inode *dir, struct dentry *dentry,
 			   umode_t mode, bool excl)
 {
-	return simplefs_create_fs_object(dir, dentry, mode);
+	printk(KERN_INFO "TYQ: simplefs_create parent dir inode=%lu, name=%s\n", dir->i_ino, dentry->d_name.name);
+	return simplefs_create_fs_object(dir, dentry, mode, NULL);
 }
 
 struct dentry *simplefs_lookup(struct inode *parent_inode,
@@ -593,6 +953,10 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 	struct buffer_head *bh;
 	struct simplefs_dir_record *record;
 	int i;
+
+	printk(KERN_INFO "TYQ: simplefs_lookup parent inode=%lu, lookup dentry name=%s\n",
+			parent_inode->i_ino, child_dentry->d_name.name);
+
 
 	bh = sb_bread(sb, parent->data_block_number);
 	BUG_ON(!bh);
@@ -615,19 +979,29 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 			inode->i_ino = record->inode_no;
 			inode_init_owner(inode, parent_inode, sfs_inode->mode);
 			inode->i_sb = sb;
-			inode->i_op = &simplefs_inode_ops;
 
 			if (S_ISDIR(inode->i_mode))
+			{
 				inode->i_fop = &simplefs_dir_operations;
+				inode->i_op = &simplefs_dir_inode_ops;
+			}
 			else if (S_ISREG(inode->i_mode))
+			{
 				inode->i_fop = &simplefs_file_operations;
+				inode->i_op = &simplefs_file_inode_ops;
+			}
+			else if (S_ISLNK(inode->i_mode))
+			{
+				inode->i_fop = NULL;
+				inode->i_op = &simplefs_link_inode_ops;
+			}
 			else
 				printk(KERN_ERR
 				       "Unknown inode type. Neither a directory nor a file");
 
 			/* FIXME: We should store these times to disk and retrieve them */
 			inode->i_atime = inode->i_mtime = inode->i_ctime =
-			    CURRENT_TIME;
+			    current_time(inode);
 
 			inode->i_private = sfs_inode;
 
@@ -670,6 +1044,8 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	struct simplefs_super_block *sb_disk;
 	int ret = -EPERM;
 
+	printk(KERN_INFO "TYQ: simplefs_fill_super\n");
+
 	bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK_NUMBER);
 	BUG_ON(!bh);
 
@@ -707,10 +1083,10 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	root_inode->i_ino = SIMPLEFS_ROOTDIR_INODE_NUMBER;
 	inode_init_owner(root_inode, NULL, S_IFDIR);
 	root_inode->i_sb = sb;
-	root_inode->i_op = &simplefs_inode_ops;
+	root_inode->i_op = &simplefs_dir_inode_ops;
 	root_inode->i_fop = &simplefs_dir_operations;
 	root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime =
-	    CURRENT_TIME;
+	    current_time(root_inode);
 
 	root_inode->i_private =
 	    simplefs_get_inode(sb, SIMPLEFS_ROOTDIR_INODE_NUMBER);
@@ -741,7 +1117,7 @@ static struct dentry *simplefs_mount(struct file_system_type *fs_type,
 				     void *data)
 {
 	struct dentry *ret;
-
+	printk(KERN_INFO "TYQ: simplefs_mount dev_name=%s\n", dev_name);
 	ret = mount_bdev(fs_type, flags, dev_name, data, simplefs_fill_super);
 
 	if (unlikely(IS_ERR(ret)))
