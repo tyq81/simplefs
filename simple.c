@@ -1460,5 +1460,5 @@ static void simplefs_exit(void)
 module_init(simplefs_init);
 module_exit(simplefs_exit);
 
-MODULE_LICENSE("CC0");
-MODULE_AUTHOR("Sankar P");
+MODULE_LICENSE("GPL");
+
