@@ -14,6 +14,12 @@
 #include <linux/slab.h>
 #include <linux/random.h>
 #include <linux/version.h>
+#include <linux/mpage.h>
+#include <linux/uio.h>
+#include <linux/iomap.h>
+#include <linux/quotaops.h>
+#include <linux/xattr.h>
+#include <linux/posix_acl.h>
 
 #include "super.h"
 #define f_dentry f_path.dentry
@@ -113,7 +119,7 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
 	memcpy(inode_iterator, inode, sizeof(struct simplefs_inode));
 	sb->inodes_count++;
 	sb->inodes_table |= (1<<(inode->inode_no - 1));
-	printk(KERN_INFO "inode_no=%llu, inodes_table=%llx, inodes_count=%%lu\n", inode->inode_no,
+	printk(KERN_INFO "inode_no=%llu, inodes_table=%llx, inodes_count=%llu\n", inode->inode_no,
 			sb->inodes_table, sb->inodes_count);
 	mark_buffer_dirty(bh);
 	simplefs_sb_sync(vsb);
@@ -233,6 +239,30 @@ static int simplefs_sb_get_objects_count(struct super_block *vsb,
 	return 0;
 }
 
+static inline void simplefs_put_page(struct page *page)
+{
+	kunmap(page);
+	put_page(page);
+}
+
+static struct page * simplefs_get_page(struct inode *dir, unsigned long n)
+{
+	struct address_space *mapping = dir->i_mapping;
+	struct page *page = read_mapping_page(mapping, n, NULL);
+	if (!IS_ERR(page)) {
+		kmap(page);
+		if (unlikely(!PageChecked(page))) {
+			if (PageError(page))
+				goto fail;
+		}
+	}
+	return page;
+
+fail:
+	simplefs_put_page(page);
+	return ERR_PTR(-EIO);
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
 static int simplefs_iterate(struct file *filp, struct dir_context *ctx)
 #else
@@ -242,12 +272,14 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 	loff_t pos;
 	struct inode *inode;
 	struct super_block *sb;
-	struct buffer_head *bh;
 	struct simplefs_inode *sfs_inode;
 	struct simplefs_dir_record *record;
+	char *kaddr;
+	char *endaddr;
+	struct page *page;
 	int i;
 
-	printk(KERN_INFO "TYQ: simplefs_iterate %s\n", filp->f_dentry->d_name.name);
+	printk(KERN_DEBUG "simplefs_iterate %s\n", filp->f_dentry->d_name.name);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
 	pos = ctx->pos;
 #else
@@ -273,24 +305,36 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 		return -ENOTDIR;
 	}
 
-	bh = sb_bread(sb, sfs_inode->data_block_number);
-	BUG_ON(!bh);
+	page = simplefs_get_page(inode, 0);
 
-	record = (struct simplefs_dir_record *)bh->b_data;
-	for (i = 0; i < sfs_inode->dir_children_count; i++) {
+	if (IS_ERR(page)) {
+		printk(KERN_ERR "bad page in #%lu", inode->i_ino);
+		ctx->pos += PAGE_SIZE;
+		return PTR_ERR(page);
+	}
+
+	kaddr = page_address(page);
+	endaddr = kaddr + inode->i_size;
+	record = (struct simplefs_dir_record *)kaddr;
+	for (i = 0; i < sfs_inode->dir_children_count && (char*)record < endaddr;)
+	{
+		if(record->inode_no != 0)
+		{
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
-		dir_emit(ctx, record->filename, SIMPLEFS_FILENAME_MAXLEN,
-			record->inode_no, DT_UNKNOWN);
-		ctx->pos += sizeof(struct simplefs_dir_record);
+			dir_emit(ctx, record->filename, SIMPLEFS_FILENAME_MAXLEN,
+					record->inode_no, DT_UNKNOWN);
+			ctx->pos += sizeof(struct simplefs_dir_record);
 #else
-		filldir(dirent, record->filename, SIMPLEFS_FILENAME_MAXLEN, pos,
-			record->inode_no, DT_UNKNOWN);
-		filp->f_pos += sizeof(struct simplefs_dir_record);
+			filldir(dirent, record->filename, SIMPLEFS_FILENAME_MAXLEN, pos,
+					record->inode_no, DT_UNKNOWN);
+			filp->f_pos += sizeof(struct simplefs_dir_record);
 #endif
-		pos += sizeof(struct simplefs_dir_record);
+			pos += sizeof(struct simplefs_dir_record);
+			i++;
+		}
 		record++;
 	}
-	brelse(bh);
+	simplefs_put_page(page);
 
 	return 0;
 }
@@ -335,52 +379,6 @@ struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 	return inode_buffer;
 }
 
-ssize_t simplefs_read(struct file * filp, char __user * buf, size_t len,
-		      loff_t * ppos)
-{
-	/* After the commit dd37978c5 in the upstream linux kernel,
-	 * we can use just filp->f_inode instead of the
-	 * f->f_path.dentry->d_inode redirection */
-	struct simplefs_inode *inode =
-	    SIMPLEFS_INODE(filp->f_path.dentry->d_inode);
-	struct buffer_head *bh;
-
-	char *buffer;
-	int nbytes;
-
-	printk(KERN_INFO "TYQ: simplefs_read %s\n", filp->f_path.dentry->d_name.name);
-
-	if (*ppos >= inode->file_size) {
-		/* Read request with offset beyond the filesize */
-		return 0;
-	}
-
-	bh = sb_bread(filp->f_path.dentry->d_inode->i_sb,
-					    inode->data_block_number);
-
-	if (!bh) {
-		printk(KERN_ERR "Reading the block number [%llu] failed.",
-		       inode->data_block_number);
-		return 0;
-	}
-
-	buffer = (char *)bh->b_data;
-	nbytes = min((size_t) inode->file_size, len);
-
-	if (copy_to_user(buf, buffer, nbytes)) {
-		brelse(bh);
-		printk(KERN_ERR
-		       "Error copying file contents to the userspace buffer\n");
-		return -EFAULT;
-	}
-
-	brelse(bh);
-
-	*ppos += nbytes;
-
-	return nbytes;
-}
-
 /* Save the modified inode */
 int simplefs_inode_save(struct super_block *sb, struct simplefs_inode *sfs_inode)
 {
@@ -419,82 +417,26 @@ int simplefs_inode_save(struct super_block *sb, struct simplefs_inode *sfs_inode
 	return 0;
 }
 
-/* FIXME: The write support is rudimentary. I have not figured out a way to do writes
- * from particular offsets (even though I have written some untested code for this below) efficiently. */
-ssize_t simplefs_write(struct file * filp, const char __user * buf, size_t len,
-		       loff_t * ppos)
+static ssize_t simplefs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	/* After the commit dd37978c5 in the upstream linux kernel,
-	 * we can use just filp->f_inode instead of the
-	 * f->f_path.dentry->d_inode redirection */
-	struct inode *inode;
-	struct simplefs_inode *sfs_inode;
-	struct buffer_head *bh;
-	struct super_block *sb;
-
-	char *buffer;
-
-	int retval;
-
-	printk(KERN_INFO "TYQ: simplefs_write %s\n", filp->f_path.dentry->d_name.name);
-	//TODO: replace generic write checks
-//	retval = generic_write_checks(filp, ppos, &len, 0);
-//	if (retval) {
-//		return retval;
-//	}
-
-	inode = filp->f_path.dentry->d_inode;
-	sfs_inode = SIMPLEFS_INODE(inode);
-	sb = inode->i_sb;
-
-	bh = sb_bread(filp->f_path.dentry->d_inode->i_sb,
-					    sfs_inode->data_block_number);
-
-	if (!bh) {
-		printk(KERN_ERR "Reading the block number [%llu] failed.",
-		       sfs_inode->data_block_number);
-		return 0;
-	}
-	buffer = (char *)bh->b_data;
-
-	/* Move the pointer until the required byte offset */
-	buffer += *ppos;
-
-	if (copy_from_user(buffer, buf, len)) {
-		brelse(bh);
-		printk(KERN_ERR
-		       "Error copying file contents from the userspace buffer to the kernel space\n");
-		return -EFAULT;
-	}
-	*ppos += len;
-
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
-
-	/* Set new size
-	 * sfs_inode->file_size = max(sfs_inode->file_size, *ppos);
-	 *
-	 * FIXME: What to do if someone writes only some parts in between ?
-	 * The above code will also fail in case a file is overwritten with
-	 * a shorter buffer */
-	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
-		sfs_trace("Failed to acquire mutex lock\n");
-		return -EINTR;
-	}
-	sfs_inode->file_size = *ppos;
-	retval = simplefs_inode_save(sb, sfs_inode);
-	if (retval) {
-		len = retval;
-	}
-	mutex_unlock(&simplefs_inodes_mgmt_lock);
-
-	return len;
+	return generic_file_read_iter(iocb, to);
 }
 
+static ssize_t simplefs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	return generic_file_write_iter(iocb, from);
+}
+
+
 const struct file_operations simplefs_file_operations = {
-	.read = simplefs_read,
-	.write = simplefs_write,
+		.llseek		= generic_file_llseek,
+		.read_iter	= simplefs_file_read_iter,
+		.write_iter	= simplefs_file_write_iter,
+		.mmap		= generic_file_mmap,
+		.fsync		= generic_file_fsync,
+		.get_unmapped_area = thp_get_unmapped_area,
+		.splice_read	= generic_file_splice_read,
+		.splice_write	= iter_file_splice_write,
 };
 
 const struct file_operations simplefs_dir_operations = {
@@ -521,12 +463,11 @@ static int simplefs_create(struct inode *dir, struct dentry *dentry,
 static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 			  umode_t mode);
 
-static const char *simplefs_get_link(struct dentry *, struct inode *, struct delayed_call *);
+static int simplefs_setattr(struct dentry *dentry, struct iattr *iattr);
+
 
 static struct inode_operations simplefs_file_inode_ops = {
-//		.link = simplefs_link,
-//		.unlink = simplefs_unlink,
-//		.symlink = simplefs_symlink,
+	.setattr	= simplefs_setattr,
 };
 
 static struct inode_operations simplefs_dir_inode_ops = {
@@ -540,22 +481,222 @@ static struct inode_operations simplefs_dir_inode_ops = {
 };
 
 static struct inode_operations simplefs_link_inode_ops = {
-		.get_link = simplefs_get_link,
+		.get_link = page_get_link,
+		.setattr = simplefs_setattr,
 };
 
+static void simplefs_write_failed(struct address_space *mapping, loff_t to)
+{
+	printk(KERN_DEBUG "simplefs_write_failed\n");
+	struct inode *inode = mapping->host;
+
+	if (to > inode->i_size)
+	{
+		truncate_pagecache(inode, inode->i_size);
+	}
+}
+
+static int simplefs_get_block(struct inode *inode, sector_t iblock,
+		struct buffer_head *bh_result, int create)
+{
+	struct simplefs_inode *sfs_inode;
+	uint64_t bno;
+	sfs_inode = SIMPLEFS_INODE(inode);
+
+	bno = sfs_inode->data_block_number;
+	map_bh(bh_result, inode->i_sb, bno);
+	bh_result->b_size = SIMPLEFS_DEFAULT_BLOCK_SIZE;
+
+	return 0;
+}
+
+static int simplefs_writepage(struct page *page, struct writeback_control *wbc)
+{
+	printk(KERN_DEBUG "simplefs_writepage\n");
+	return block_write_full_page(page, simplefs_get_block, wbc);
+}
+
+static int simplefs_readpage(struct file *file, struct page *page)
+{
+	printk(KERN_DEBUG "simplefs_readpage\n");
+	return mpage_readpage(page, simplefs_get_block);
+}
+
+static int simplefs_readpages(struct file *file, struct address_space *mapping,
+		struct list_head *pages, unsigned nr_pages)
+{
+	printk(KERN_DEBUG "simplefs_readpages\n");
+	return mpage_readpages(mapping, pages, nr_pages, simplefs_get_block);
+}
+
+static int simplefs_write_begin(struct file *file, struct address_space *mapping,
+		loff_t pos, unsigned len, unsigned flags, struct page **pagep, void **fsdata)
+{
+	int ret;
+
+	printk(KERN_DEBUG "simplefs_write_begin\n");
+
+	ret = block_write_begin(mapping, pos, len, flags, pagep,
+			simplefs_get_block);
+	if (ret < 0)
+		simplefs_write_failed(mapping, pos + len);
+	return ret;
+}
+
+static int simplefs_write_end(struct file *file, struct address_space *mapping,
+			loff_t pos, unsigned len, unsigned copied, struct page *page, void *fsdata)
+{
+	int ret;
+
+	printk(KERN_DEBUG "simplefs_write_end, %lld, %u, %u\n", pos, len, copied);
+
+	ret = generic_write_end(file, mapping, pos, len, copied, page, fsdata);
+	if (ret < len)
+		simplefs_write_failed(mapping, pos + len);
+	return ret;
+}
+
+static sector_t simplefs_bmap(struct address_space *mapping, sector_t block)
+{
+	printk(KERN_DEBUG "simplefs_bmap\n");
+	return generic_block_bmap(mapping, block, simplefs_get_block);
+}
+
+static ssize_t simplefs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct file *file = iocb->ki_filp;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
+	size_t count = iov_iter_count(iter);
+	loff_t offset = iocb->ki_pos;
+	ssize_t ret;
+
+	if (WARN_ON_ONCE(IS_DAX(inode)))
+		return -EIO;
+
+	printk(KERN_DEBUG "simplefs_direct_IO\n");
+
+	ret = blockdev_direct_IO(iocb, inode, iter, simplefs_get_block);
+	if (ret < 0 && iov_iter_rw(iter) == WRITE)
+		simplefs_write_failed(mapping, offset + count);
+	return ret;
+}
+
+static int simplefs_writepages(struct address_space *mapping,
+								struct writeback_control *wbc)
+{
+	printk(KERN_DEBUG "simplefs_writepages\n");
+	return mpage_writepages(mapping, wbc, simplefs_get_block);
+}
+
+
+static struct address_space_operations simplefs_aops = {
+		.readpage		= simplefs_readpage,
+		.readpages		= simplefs_readpages,
+		.writepage		= simplefs_writepage,
+		.write_begin		= simplefs_write_begin,
+		.write_end		= simplefs_write_end,
+		.bmap			= simplefs_bmap,
+		.direct_IO		= simplefs_direct_IO,
+		.writepages		= simplefs_writepages,
+		.migratepage		= buffer_migrate_page,
+		.is_partially_uptodate	= block_is_partially_uptodate,
+		.error_remove_page	= generic_error_remove_page,
+};
+
+static int simplefs_commit_chunk(struct page *page, loff_t pos, unsigned len)
+{
+	struct address_space *mapping = page->mapping;
+	struct inode *inode = mapping->host;
+	int err = 0;
+
+	inode->i_version++;
+	block_write_end(NULL, mapping, pos, len, len, page, NULL);
+
+	if (pos+len > inode->i_size)
+	{
+		i_size_write(inode, pos+len);
+		mark_inode_dirty(inode);
+	}
+
+	err = write_one_page(page);
+	if (!err)
+		err = sync_inode_metadata(inode, 1);
+
+	return err;
+}
+
+static int simplefs_add_entry(struct dentry *dentry, struct inode *inode)
+{
+	struct inode *dir = d_inode(dentry->d_parent);
+	struct page *page = NULL;
+	struct simplefs_dir_record *dir_contents_datablock;
+
+	char *kaddr;
+	loff_t pos;
+	int err;
+	int i;
+
+	/*
+	 * We take care of directory expansion in the same loop.
+	 * This code plays outside i_size, so it locks the page
+	 * to protect that region.
+	 */
+	page = simplefs_get_page(dir, 0);
+	err = PTR_ERR(page);
+	if (IS_ERR(page))
+		goto out;
+	lock_page(page);
+	kaddr = page_address(page);
+	dir_contents_datablock = (struct simplefs_dir_record *)kaddr;
+	/* Navigate to the last record in the directory contents */
+	for(i=0; i<SIMPLEFS_MAX_DIR_RECORD_COUNT; i++)
+	{
+		if(dir_contents_datablock->inode_no == 0)
+		{
+			break;
+		}
+		dir_contents_datablock++;
+	}
+
+	if(i == SIMPLEFS_MAX_DIR_RECORD_COUNT)
+	{
+		printk(KERN_ERR
+				"Maximum number of dir record supported by simplefs is already reached");
+		err = -ENOSPC;
+		goto out_unlock;
+	}
+
+	pos = (char*)dir_contents_datablock - (char*)page_address(page);
+	err = __block_write_begin(page, pos, sizeof(struct simplefs_dir_record), simplefs_get_block);
+	if (err)
+		goto out_unlock;
+
+	dir_contents_datablock->inode_no = inode->i_ino;
+	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
+
+	err = simplefs_commit_chunk(page, pos, sizeof(struct simplefs_dir_record));
+	dir->i_mtime = dir->i_ctime = current_time(dir);
+	/* OFFSET_CACHE */
+out_put:
+	simplefs_put_page(page);
+out:
+	return err;
+out_unlock:
+	unlock_page(page);
+	goto out_put;
+}
+
 static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
-				     umode_t mode, struct inode **out)
+				     umode_t mode, unsigned size, struct inode **out)
 {
 	struct inode *inode;
 	struct simplefs_inode *sfs_inode;
 	struct super_block *sb;
 	struct simplefs_inode *parent_dir_inode;
-	struct buffer_head *bh;
-	struct simplefs_dir_record *dir_contents_datablock;
 	uint64_t count;
 	uint64_t next_inode_no;
 	int ret;
-	int i;
 	int isclear_data;
 
 	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
@@ -595,10 +736,13 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	inode->i_sb = sb;
 	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
 	inode->i_ino = next_inode_no;
-			//(count + SIMPLEFS_START_INO - SIMPLEFS_RESERVED_INODES + 1);
+	inode->i_blocks = 1;
+	inode->i_size = size;
+	inode->i_flags |= S_SYNC;
 
 	sfs_inode = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
 	sfs_inode->inode_no = inode->i_ino;
+	sfs_inode->file_size = size;
 	inode->i_private = sfs_inode;
 	sfs_inode->mode = mode;
 
@@ -608,19 +752,21 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 		sfs_inode->dir_children_count = 0;
 		inode->i_fop = &simplefs_dir_operations;
 		inode->i_op = &simplefs_dir_inode_ops;
+		inode->i_mapping->a_ops = &simplefs_aops;
 		isclear_data = 1;
 	} else if (S_ISREG(mode)) {
 		printk(KERN_INFO "New file creation request\n");
-		sfs_inode->file_size = 0;
 		inode->i_fop = &simplefs_file_operations;
 		inode->i_op = &simplefs_file_inode_ops;
+		inode->i_mapping->a_ops = &simplefs_aops;
 	}
 	else if(S_ISLNK(mode))
 	{
 		printk(KERN_INFO "New link creation request\n");
-		sfs_inode->file_size = 0;
 		inode->i_fop = NULL;
 		inode->i_op = &simplefs_link_inode_ops;
+		inode->i_mapping->a_ops = &simplefs_aops;
+		inode_nohighmem(inode);
 	}
 
 	/* First get a free block and update the free map,
@@ -631,7 +777,8 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	 * even in most crashes
 	 */
 	ret = simplefs_sb_get_a_freeblock(sb, &sfs_inode->data_block_number, isclear_data);
-	if (ret < 0) {
+	if (ret < 0)
+	{
 		printk(KERN_ERR "simplefs could not get a freeblock");
 		mutex_unlock(&simplefs_directory_children_update_lock);
 		return ret;
@@ -639,65 +786,133 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 
 	simplefs_inode_add(sb, sfs_inode);
 
+	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock))
+	{
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		sfs_trace("Failed to acquire mutex lock\n");
+		return -EINTR;
+	}
+
 	parent_dir_inode = SIMPLEFS_INODE(dir);
-	bh = sb_bread(sb, parent_dir_inode->data_block_number);
-	BUG_ON(!bh);
+	parent_dir_inode->dir_children_count++;
 
-	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
+	mark_inode_dirty(dir);
 
-	/* Navigate to the last record in the directory contents */
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+
+	ret = simplefs_add_entry(dentry, inode);
+	if(ret < 0)
+	{
+		printk(KERN_ERR "simplefs could not update parent inode");
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		return ret;
+	}
+
+	mutex_unlock(&simplefs_directory_children_update_lock);
+
+	inode_init_owner(inode, dir, mode);
+	d_add(dentry, inode);
+
+	mark_inode_dirty(inode);
+
+	if(out)
+	{
+		*out = inode;
+	}
+	return 0;
+}
+
+static int simplefs_find_entry(struct inode *dir, unsigned long inode_no)
+{
+	struct page *page = NULL;
+	struct simplefs_dir_record *dir_contents_datablock;
+	char *kaddr;
+	int err;
+	int i;
+	int ref_count = 0;
+
+	page = simplefs_get_page(dir, 0);
+	err = PTR_ERR(page);
+	if (IS_ERR(page))
+		goto out_put;
+	lock_page(page);
+	kaddr = page_address(page);
+	dir_contents_datablock = (struct simplefs_dir_record *)kaddr;
 	for(i=0; i<SIMPLEFS_MAX_DIR_RECORD_COUNT; i++)
 	{
-		if(dir_contents_datablock->inode_no == 0)
-		{
+		if(dir_contents_datablock->inode_no == inode_no)
+			ref_count++;
+
+		dir_contents_datablock++;
+	}
+
+out_put:
+	unlock_page(page);
+	simplefs_put_page(page);
+
+	return ref_count;
+}
+
+static int simplefs_delete_entry(struct dentry *dentry, struct inode *inode)
+{
+	struct inode *dir = d_inode(dentry->d_parent);
+	const char *name = dentry->d_name.name;
+	int namelen = dentry->d_name.len;
+	struct page *page = NULL;
+	struct simplefs_dir_record *dir_contents_datablock;
+	char *kaddr;
+	loff_t pos;
+	int err;
+	int i;
+
+	/*
+	 * We take care of directory expansion in the same loop.
+	 * This code plays outside i_size, so it locks the page
+	 * to protect that region.
+	 */
+	page = simplefs_get_page(dir, 0);
+	err = PTR_ERR(page);
+	if (IS_ERR(page))
+		goto out;
+	lock_page(page);
+	kaddr = page_address(page);
+	dir_contents_datablock = (struct simplefs_dir_record *)kaddr;
+	for(i=0; i<SIMPLEFS_MAX_DIR_RECORD_COUNT; i++)
+	{
+		if(dir_contents_datablock->inode_no == inode->i_ino
+			&& namelen == strlen(dir_contents_datablock->filename)
+			&& memcmp(dir_contents_datablock->filename, name, namelen) == 0)
 			break;
-		}
+
 		dir_contents_datablock++;
 	}
 
 	if(i == SIMPLEFS_MAX_DIR_RECORD_COUNT)
 	{
 		printk(KERN_ERR
-				"Maximum number of dir record supported by simplefs is already reached");
-		mutex_unlock(&simplefs_directory_children_update_lock);
-		return -ENOSPC;
+				"can't find expected entry in parent dir.\n");
+		err = -ENOSPC;
+		goto out_unlock;
 	}
 
-	dir_contents_datablock->inode_no = sfs_inode->inode_no;
-	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
+	pos = (char*)dir_contents_datablock - (char*)page_address(page);
+	err = __block_write_begin(page, pos, sizeof(struct simplefs_dir_record), simplefs_get_block);
+	if (err)
+		goto out_unlock;
 
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
+	dir_contents_datablock->inode_no = 0;
 
-	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
-		mutex_unlock(&simplefs_directory_children_update_lock);
-		sfs_trace("Failed to acquire mutex lock\n");
-		return -EINTR;
-	}
+	err = simplefs_commit_chunk(page, pos, sizeof(struct simplefs_dir_record));
+	dir->i_mtime = dir->i_ctime = current_time(dir);
 
-	parent_dir_inode->dir_children_count++;
-	ret = simplefs_inode_save(sb, parent_dir_inode);
-	if (ret) {
-		mutex_unlock(&simplefs_inodes_mgmt_lock);
-		mutex_unlock(&simplefs_directory_children_update_lock);
-
-		/* TODO: Remove the newly created inode from the disk and in-memory inode store
-		 * and also update the superblock, freemaps etc. to reflect the same.
-		 * Basically, Undo all actions done during this create call */
-		return ret;
-	}
-
-	mutex_unlock(&simplefs_inodes_mgmt_lock);
-	mutex_unlock(&simplefs_directory_children_update_lock);
-
-	inode_init_owner(inode, dir, mode);
-	d_add(dentry, inode);
-
-	if(out)
-		*out = inode;
-
-	return 0;
+	/* OFFSET_CACHE */
+out_put:
+	simplefs_put_page(page);
+out:
+	return err;
+out_unlock:
+	unlock_page(page);
+	goto out_put;
 }
 
 static int simplefs_remove_fs_object(struct inode *parent_dir, struct dentry *dentry)
@@ -706,9 +921,6 @@ static int simplefs_remove_fs_object(struct inode *parent_dir, struct dentry *de
 	struct simplefs_inode *sfs_inode;
 	struct super_block *sb;
 	struct simplefs_inode *parent_dir_inode;
-	struct buffer_head *bh;
-	struct simplefs_dir_record *dir_contents_datablock;
-	int i;
 	int ret;
 
 	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
@@ -719,36 +931,19 @@ static int simplefs_remove_fs_object(struct inode *parent_dir, struct dentry *de
 	inode = dentry->d_inode;
 	sfs_inode = SIMPLEFS_INODE(dentry->d_inode);
 
-	/* Remove data block */
-	ret = simplefs_sb_release_a_datablock(sb, sfs_inode->data_block_number);
-	if (ret < 0) {
-		printk(KERN_ERR "simplefs could not release datablock");
-		mutex_unlock(&simplefs_directory_children_update_lock);
-		return ret;
-	}
-
-	/* Release inode from inode table */
-	simplefs_inode_del(sb, sfs_inode);
-
-	/* Remove from parent dir data block */
-	parent_dir_inode = SIMPLEFS_INODE(parent_dir);
-	bh = sb_bread(sb, parent_dir_inode->data_block_number);
-	BUG_ON(!bh);
-
-	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
-	for(i=0; i<SIMPLEFS_MAX_DIR_RECORD_COUNT; i++)
+	if(simplefs_find_entry(parent_dir, inode->i_ino) == 1)
 	{
-		if(dir_contents_datablock->inode_no == sfs_inode->inode_no)
-		{
-			dir_contents_datablock->inode_no = 0;
-			break;
+		/* Remove data block */
+		ret = simplefs_sb_release_a_datablock(sb, sfs_inode->data_block_number);
+		if (ret < 0) {
+			printk(KERN_ERR "simplefs could not release datablock");
+			mutex_unlock(&simplefs_directory_children_update_lock);
+			return ret;
 		}
-		dir_contents_datablock++;
-	}
 
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
+		/* Release inode from inode table */
+		simplefs_inode_del(sb, sfs_inode);
+	}
 
 	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
 		mutex_unlock(&simplefs_directory_children_update_lock);
@@ -757,35 +952,36 @@ static int simplefs_remove_fs_object(struct inode *parent_dir, struct dentry *de
 	}
 
 	/* Reduce the children count from parent dir  */
+	parent_dir_inode = SIMPLEFS_INODE(parent_dir);
 	parent_dir_inode->dir_children_count--;
-	ret = simplefs_inode_save(sb, parent_dir_inode);
-	if (ret) {
-		mutex_unlock(&simplefs_inodes_mgmt_lock);
-		mutex_unlock(&simplefs_directory_children_update_lock);
+	mark_inode_dirty(parent_dir);
 
-		/* TODO: Remove the newly created inode from the disk and in-memory inode store
-		 * and also update the superblock, freemaps etc. to reflect the same.
-		 * Basically, Undo all actions done during this create call */
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+
+	/* Remove from parent dir data block */
+	ret = simplefs_delete_entry(dentry, inode);
+	if(ret < 0)
+	{
+		printk(KERN_ERR "simplefs could not update parent inode");
+		mutex_unlock(&simplefs_directory_children_update_lock);
 		return ret;
 	}
 
-	mutex_unlock(&simplefs_inodes_mgmt_lock);
 	mutex_unlock(&simplefs_directory_children_update_lock);
 
 	inode_dec_link_count(inode);
-
 	return 0;
 }
 
 static int simplefs_unlink(struct inode * parent_dir, struct dentry *dentry)
 {
-	printk(KERN_INFO "TYQ: simplefs_unlink parent dir inode=%lu, name=%s\n", parent_dir->i_ino, dentry->d_name.name);
+	printk(KERN_DEBUG "simplefs_unlink parent dir inode=%lu, name=%s\n", parent_dir->i_ino, dentry->d_name.name);
 	return simplefs_remove_fs_object(parent_dir, dentry);
 }
 
 static int simplefs_rmdir (struct inode * parent_dir, struct dentry *dentry)
 {
-	printk(KERN_INFO "TYQ: simplefs_rmdir inode=%lu, name=%s\n", parent_dir->i_ino, dentry->d_name.name);
+	printk(KERN_DEBUG "simplefs_rmdir inode=%lu, name=%s\n", parent_dir->i_ino, dentry->d_name.name);
 	struct simplefs_inode *sfs_inode;
 	sfs_inode = SIMPLEFS_INODE(dentry->d_inode);
 	if(sfs_inode->dir_children_count > 0)
@@ -794,51 +990,16 @@ static int simplefs_rmdir (struct inode * parent_dir, struct dentry *dentry)
 	return simplefs_remove_fs_object(parent_dir, dentry);
 }
 
-static const char *simplefs_get_link(struct dentry *dentry, struct inode *inode,
-			    struct delayed_call *done)
-{
-	printk(KERN_INFO "TYQ: simplefs_get_link inode=%lu\n", inode->i_ino);
-
-	char *target_path = NULL;
-	struct buffer_head *bh;
-	struct simplefs_inode *sfs_inode;
-	char *buffer;
-
-	sfs_inode = SIMPLEFS_INODE(inode);
-	bh = sb_bread(inode->i_sb, sfs_inode->data_block_number);
-	if (!bh)
-	{
-		printk(KERN_ERR "Reading the block number [%llu] failed.",
-				sfs_inode->data_block_number);
-		return ERR_PTR(-EINVAL);
-	}
-
-	buffer = (char *)bh->b_data;
-	printk(KERN_INFO "get symlink path is %s, %d\n", buffer, strlen(buffer)+1);
-	target_path = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if(target_path == NULL)
-	{
-		brelse(bh);
-		return ERR_PTR(-ENOMEM);
-	}
-	strcpy(target_path, buffer);
-
-	brelse(bh);
-	set_delayed_call(done, kfree_link, target_path);
-	return target_path;
-}
 
 static int simplefs_link (struct dentry * old_dentry, struct inode * dir,
 				struct dentry *dentry)
 {
-	printk(KERN_INFO "TYQ: simplefs_link inode=%lu, oldname=%s, name=%s\n",
+	printk(KERN_DEBUG "simplefs_link inode=%lu, oldname=%s, name=%s\n",
 			dir->i_ino, old_dentry->d_name.name, dentry->d_name.name);
 	struct inode *inode = d_inode(old_dentry);
 	struct super_block *sb;
 	struct simplefs_inode *parent_dir_inode;
 	int err;
-	struct buffer_head *bh;
-	struct simplefs_dir_record *dir_contents_datablock;
 
 	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
 		sfs_trace("Failed to acquire mutex lock\n");
@@ -850,83 +1011,75 @@ static int simplefs_link (struct dentry * old_dentry, struct inode * dir,
 	inode_inc_link_count(inode);
 	ihold(inode);
 
-	parent_dir_inode = SIMPLEFS_INODE(dir);
-	bh = sb_bread(sb, parent_dir_inode->data_block_number);
-	BUG_ON(!bh);
-
-	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
-
-	/* Navigate to the last record in the directory contents */
-	dir_contents_datablock += parent_dir_inode->dir_children_count;
-
-	dir_contents_datablock->inode_no = inode->i_ino;
-	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
-
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
-
 	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
 		mutex_unlock(&simplefs_directory_children_update_lock);
 		sfs_trace("Failed to acquire mutex lock\n");
 		return -EINTR;
 	}
 
+	parent_dir_inode = SIMPLEFS_INODE(dir);
 	parent_dir_inode->dir_children_count++;
-	err = simplefs_inode_save(sb, parent_dir_inode);
-	if (err) {
-		mutex_unlock(&simplefs_inodes_mgmt_lock);
-		mutex_unlock(&simplefs_directory_children_update_lock);
+	mark_inode_dirty(dir);
 
-		/* TODO: Remove the newly created inode from the disk and in-memory inode store
-		 * and also update the superblock, freemaps etc. to reflect the same.
-		 * Basically, Undo all actions done during this create call */
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+
+	err = simplefs_add_entry(dentry, inode);
+	if(err < 0)
+	{
+		printk(KERN_ERR "simplefs could not update parent inode");
+		mutex_unlock(&simplefs_directory_children_update_lock);
 		return err;
 	}
 
-	mutex_unlock(&simplefs_inodes_mgmt_lock);
 	mutex_unlock(&simplefs_directory_children_update_lock);
+
 	if (!err) {
-		d_instantiate(dentry, inode);
+		d_add(dentry, inode);
 		return 0;
 	}
 	inode_dec_link_count(inode);
 	iput(inode);
+
 	return err;
 }
 
 static int simplefs_symlink (struct inode * dir, struct dentry * dentry,
 				const char * symname)
 {
-	int ret;
+	int err;
 	struct inode *inode = NULL;
-	struct simplefs_inode *sfs_inode;
-	struct super_block *sb;
-	struct buffer_head *bh;
-	char *buffer;
+	unsigned l = strlen(symname)+1;
+	struct page *page;
 
-	printk(KERN_INFO "TYQ: simplefs_symlink inode=%lu, name=%s, symname=%s\n",
+	printk(KERN_DEBUG "simplefs_symlink inode=%lu, name=%s, symname=%s\n",
 				dir->i_ino, dentry->d_name.name, symname);
-	if(ret = simplefs_create_fs_object(dir, dentry, S_IFLNK | S_IRWXUGO, &inode))
-		return ret;
+	err = simplefs_create_fs_object(dir, dentry, S_IFLNK | S_IRWXUGO, l, &inode);
+	if(err)
+		goto out;
 
-	sfs_inode = SIMPLEFS_INODE(inode);
-	sb = inode->i_sb;
-	bh = sb_bread(sb, sfs_inode->data_block_number);
-	if (!bh)
-	{
-		printk(KERN_ERR "Reading the block number [%llu] failed.",
-				sfs_inode->data_block_number);
-		return 0;
-	}
+	/* Set data with symname */
+	err = page_symlink(inode, symname, l);
+	if(err)
+		goto out_fail;
 
-	buffer = (char *)bh->b_data;
-	strcpy(buffer, symname);
+	page = simplefs_get_page(inode, 0);
+	err = PTR_ERR(page);
+	if (IS_ERR(page))
+		goto out_fail;
 
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
-	return 0;
+	/* Commit changes */
+	lock_page(page);
+	err = simplefs_commit_chunk(page, 0, l);
+	unlock_page(page);
+
+out:
+	return err;
+
+out_fail:
+	inode_dec_link_count(inode);
+	unlock_new_inode(inode);
+	iput (inode);
+	goto out;
 }
 
 static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
@@ -934,43 +1087,57 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 {
 	/* I believe this is a bug in the kernel, for some reason, the mkdir callback
 	 * does not get the S_IFDIR flag set. Even ext2 sets is explicitly */
-	printk(KERN_INFO "TYQ: simplefs_mkdir parent dir inode=%lu, name=%s\n", dir->i_ino, dentry->d_name.name);
-	return simplefs_create_fs_object(dir, dentry, S_IFDIR | mode, NULL);
+	printk(KERN_DEBUG "simplefs_mkdir parent dir inode=%lu, name=%s\n", dir->i_ino, dentry->d_name.name);
+	return simplefs_create_fs_object(dir, dentry, S_IFDIR | mode, SIMPLEFS_DEFAULT_BLOCK_SIZE, NULL);
 }
 
 static int simplefs_create(struct inode *dir, struct dentry *dentry,
 			   umode_t mode, bool excl)
 {
-	printk(KERN_INFO "TYQ: simplefs_create parent dir inode=%lu, name=%s\n", dir->i_ino, dentry->d_name.name);
-	return simplefs_create_fs_object(dir, dentry, mode, NULL);
+	printk(KERN_DEBUG "simplefs_create parent dir inode=%lu, name=%s\n", dir->i_ino, dentry->d_name.name);
+	return simplefs_create_fs_object(dir, dentry, mode, 0, NULL);
 }
 
 struct dentry *simplefs_lookup(struct inode *parent_inode,
 			       struct dentry *child_dentry, unsigned int flags)
 {
-	struct simplefs_inode *parent = SIMPLEFS_INODE(parent_inode);
+	struct page *page = NULL;
 	struct super_block *sb = parent_inode->i_sb;
-	struct buffer_head *bh;
+	struct simplefs_inode *parent = SIMPLEFS_INODE(parent_inode);
 	struct simplefs_dir_record *record;
+	struct inode *inode = NULL;
+	char *kaddr;
+	char *endaddr;
+	int err;
 	int i;
 
-	printk(KERN_INFO "TYQ: simplefs_lookup parent inode=%lu, lookup dentry name=%s\n",
-			parent_inode->i_ino, child_dentry->d_name.name);
+	/*
+	 * We take care of directory expansion in the same loop.
+	 * This code plays outside i_size, so it locks the page
+	 * to protect that region.
+	 */
+	page = simplefs_get_page(parent_inode, 0);
+	err = PTR_ERR(page);
+	if (IS_ERR(page))
+		return ERR_PTR(err);
+	lock_page(page);
+	kaddr = page_address(page);
+	record = (struct simplefs_dir_record *)kaddr;
+	endaddr = kaddr + parent_inode->i_size;
+	for (i = 0; i < parent->dir_children_count && (char*)record < endaddr; record++)
+	{
+		if(record->inode_no == 0)
+			continue;
 
-
-	bh = sb_bread(sb, parent->data_block_number);
-	BUG_ON(!bh);
-
-	record = (struct simplefs_dir_record *)bh->b_data;
-	for (i = 0; i < parent->dir_children_count; i++) {
-		if (!strcmp(record->filename, child_dentry->d_name.name)) {
+		if (!strcmp(record->filename, child_dentry->d_name.name))
+		{
 			/* FIXME: There is a corner case where if an allocated inode,
 			 * is not written to the inode store, but the inodes_count is
 			 * incremented. Then if the random string on the disk matches
 			 * with the filename that we are comparing above, then we
 			 * will use an invalid uninitialized inode */
 
-			struct inode *inode;
+
 			struct simplefs_inode *sfs_inode;
 
 			sfs_inode = simplefs_get_inode(sb, record->inode_no);
@@ -979,43 +1146,120 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 			inode->i_ino = record->inode_no;
 			inode_init_owner(inode, parent_inode, sfs_inode->mode);
 			inode->i_sb = sb;
+			inode->i_blocks = 1;
+			inode->i_flags |= S_SYNC;
+			inode->i_size = 0;
 
 			if (S_ISDIR(inode->i_mode))
 			{
 				inode->i_fop = &simplefs_dir_operations;
 				inode->i_op = &simplefs_dir_inode_ops;
+				inode->i_mapping->a_ops = &simplefs_aops;
+				inode->i_size = SIMPLEFS_DEFAULT_BLOCK_SIZE;
 			}
 			else if (S_ISREG(inode->i_mode))
 			{
 				inode->i_fop = &simplefs_file_operations;
 				inode->i_op = &simplefs_file_inode_ops;
+				inode->i_mapping->a_ops = &simplefs_aops;
+				inode->i_size = sfs_inode->file_size;
 			}
 			else if (S_ISLNK(inode->i_mode))
 			{
 				inode->i_fop = NULL;
 				inode->i_op = &simplefs_link_inode_ops;
+				inode->i_mapping->a_ops = &simplefs_aops;
+				inode->i_size = sfs_inode->file_size;
+				inode_nohighmem(inode);
 			}
 			else
 				printk(KERN_ERR
-				       "Unknown inode type. Neither a directory nor a file");
+						"Unknown inode type. Neither a directory nor a file");
 
 			/* FIXME: We should store these times to disk and retrieve them */
 			inode->i_atime = inode->i_mtime = inode->i_ctime =
-			    current_time(inode);
+					current_time(inode);
 
 			inode->i_private = sfs_inode;
-
-			d_add(child_dentry, inode);
-			return NULL;
+			break;
 		}
-		record++;
+
+		i++;
 	}
 
-	printk(KERN_ERR
-	       "No inode found for the filename [%s]\n",
-	       child_dentry->d_name.name);
+	unlock_page(page);
+	simplefs_put_page(page);
 
-	return NULL;
+	if(inode)
+		return d_splice_alias(inode, child_dentry);
+	else
+		return NULL;
+}
+
+static int simplefs_setsize(struct inode *inode, loff_t newsize)
+{
+	int error;
+
+	if (!(S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode)))
+		return -EINVAL;
+	if (IS_APPEND(inode) || IS_IMMUTABLE(inode))
+		return -EPERM;
+
+	inode_dio_wait(inode);
+
+	error = block_truncate_page(inode->i_mapping,
+			newsize, simplefs_get_block);
+
+	if (error)
+		return error;
+
+	truncate_setsize(inode, newsize);
+
+	inode->i_mtime = inode->i_ctime = current_time(inode);
+	sync_mapping_buffers(inode->i_mapping);
+	sync_inode_metadata(inode, 1);
+
+	return 0;
+}
+
+static int simplefs_setattr(struct dentry *dentry, struct iattr *iattr)
+{
+	printk(KERN_DEBUG "simplefs setattr %s\n", dentry->d_name.name);
+	struct inode *inode = d_inode(dentry);
+	int error;
+
+	error = setattr_prepare(dentry, iattr);
+	if (error)
+		return error;
+
+	if (is_quota_modification(inode, iattr)) {
+		error = dquot_initialize(inode);
+		if (error)
+			return error;
+	}
+	if ((iattr->ia_valid & ATTR_UID && !uid_eq(iattr->ia_uid, inode->i_uid)) ||
+	    (iattr->ia_valid & ATTR_GID && !gid_eq(iattr->ia_gid, inode->i_gid))) {
+		error = dquot_transfer(inode, iattr);
+		if (error)
+			return error;
+	}
+
+	if (iattr->ia_valid & ATTR_SIZE && iattr->ia_size != inode->i_size)
+	{
+		error = simplefs_setsize(inode, iattr->ia_size);
+		if (error)
+			return error;
+	}
+
+	setattr_copy(inode, iattr);
+	if (iattr->ia_valid & ATTR_MODE)
+	{
+		error = posix_acl_chmod(inode, inode->i_mode);
+		if(error)
+			return error;
+	}
+
+	return error;
 }
 
 
@@ -1031,8 +1275,33 @@ void simplefs_destory_inode(struct inode *inode)
 	kmem_cache_free(sfs_inode_cachep, sfs_inode);
 }
 
+int simplefs_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+	printk(KERN_DEBUG "simplefs_write_inode: %lu\n", inode->i_ino);
+	int err;
+	struct simplefs_inode *sfs_inode;
+
+	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock))
+	{
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		sfs_trace("Failed to acquire mutex lock\n");
+		return -EINTR;
+	}
+
+	sfs_inode = SIMPLEFS_INODE(inode);
+	sfs_inode->mode = inode->i_mode;
+
+	if(S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode))
+		sfs_inode->file_size = inode->i_size;
+	err = simplefs_inode_save(inode->i_sb, sfs_inode);
+
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+	return err;
+}
+
 static const struct super_operations simplefs_sops = {
 	.destroy_inode = simplefs_destory_inode,
+	.write_inode	= simplefs_write_inode,
 };
 
 /* This function, as the name implies, Makes the super_block valid and
@@ -1044,7 +1313,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	struct simplefs_super_block *sb_disk;
 	int ret = -EPERM;
 
-	printk(KERN_INFO "TYQ: simplefs_fill_super\n");
+	printk(KERN_DEBUG "simplefs_fill_super\n");
 
 	bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK_NUMBER);
 	BUG_ON(!bh);
@@ -1077,6 +1346,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_fs_info = sb_disk;
 
 	sb->s_maxbytes = SIMPLEFS_DEFAULT_BLOCK_SIZE;
+	sb_set_blocksize(sb, SIMPLEFS_DEFAULT_BLOCK_SIZE);
 	sb->s_op = &simplefs_sops;
 
 	root_inode = new_inode(sb);
@@ -1085,9 +1355,12 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	root_inode->i_sb = sb;
 	root_inode->i_op = &simplefs_dir_inode_ops;
 	root_inode->i_fop = &simplefs_dir_operations;
+	root_inode->i_mapping->a_ops = &simplefs_aops;
 	root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime =
 	    current_time(root_inode);
-
+	root_inode->i_blocks = 1;
+	root_inode->i_size = SIMPLEFS_DEFAULT_BLOCK_SIZE;
+	root_inode->i_flags |= S_SYNC;
 	root_inode->i_private =
 	    simplefs_get_inode(sb, SIMPLEFS_ROOTDIR_INODE_NUMBER);
 
@@ -1117,7 +1390,7 @@ static struct dentry *simplefs_mount(struct file_system_type *fs_type,
 				     void *data)
 {
 	struct dentry *ret;
-	printk(KERN_INFO "TYQ: simplefs_mount dev_name=%s\n", dev_name);
+	printk(KERN_DEBUG "simplefs_mount dev_name=%s\n", dev_name);
 	ret = mount_bdev(fs_type, flags, dev_name, data, simplefs_fill_super);
 
 	if (unlikely(IS_ERR(ret)))
