@@ -20,7 +20,7 @@
 #include <linux/quotaops.h>
 #include <linux/xattr.h>
 #include <linux/posix_acl.h>
-
+#include <linux/iversion.h>
 #include "super.h"
 #define f_dentry f_path.dentry
 
@@ -610,7 +610,7 @@ static int simplefs_commit_chunk(struct page *page, loff_t pos, unsigned len)
 	struct inode *inode = mapping->host;
 	int err = 0;
 
-	inode->i_version++;
+	inode_inc_iversion(inode);
 	block_write_end(NULL, mapping, pos, len, len, page, NULL);
 
 	if (pos+len > inode->i_size)
@@ -739,12 +739,14 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	inode->i_blocks = 1;
 	inode->i_size = size;
 	inode->i_flags |= S_SYNC;
+	set_nlink(inode, 1);
 
 	sfs_inode = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
 	sfs_inode->inode_no = inode->i_ino;
 	sfs_inode->file_size = size;
 	inode->i_private = sfs_inode;
 	sfs_inode->mode = mode;
+	sfs_inode->link_count = inode->i_nlink;
 
 	isclear_data = 0;
 	if (S_ISDIR(mode)) {
@@ -820,37 +822,6 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 		*out = inode;
 	}
 	return 0;
-}
-
-static int simplefs_find_entry(struct inode *dir, unsigned long inode_no)
-{
-	struct page *page = NULL;
-	struct simplefs_dir_record *dir_contents_datablock;
-	char *kaddr;
-	int err;
-	int i;
-	int ref_count = 0;
-
-	page = simplefs_get_page(dir, 0);
-	err = PTR_ERR(page);
-	if (IS_ERR(page))
-		goto out_put;
-	lock_page(page);
-	kaddr = page_address(page);
-	dir_contents_datablock = (struct simplefs_dir_record *)kaddr;
-	for(i=0; i<SIMPLEFS_MAX_DIR_RECORD_COUNT; i++)
-	{
-		if(dir_contents_datablock->inode_no == inode_no)
-			ref_count++;
-
-		dir_contents_datablock++;
-	}
-
-out_put:
-	unlock_page(page);
-	simplefs_put_page(page);
-
-	return ref_count;
 }
 
 static int simplefs_delete_entry(struct dentry *dentry, struct inode *inode)
@@ -931,7 +902,7 @@ static int simplefs_remove_fs_object(struct inode *parent_dir, struct dentry *de
 	inode = dentry->d_inode;
 	sfs_inode = SIMPLEFS_INODE(dentry->d_inode);
 
-	if(simplefs_find_entry(parent_dir, inode->i_ino) == 1)
+	if(inode->i_nlink <= 1)
 	{
 		/* Remove data block */
 		ret = simplefs_sb_release_a_datablock(sb, sfs_inode->data_block_number);
@@ -1034,6 +1005,8 @@ static int simplefs_link (struct dentry * old_dentry, struct inode * dir,
 	mutex_unlock(&simplefs_directory_children_update_lock);
 
 	if (!err) {
+		sync_mapping_buffers(inode->i_mapping);
+		sync_inode_metadata(inode, 1);
 		d_add(dentry, inode);
 		return 0;
 	}
@@ -1136,20 +1109,22 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 			 * incremented. Then if the random string on the disk matches
 			 * with the filename that we are comparing above, then we
 			 * will use an invalid uninitialized inode */
-
+			inode = iget_locked(sb, record->inode_no);
+			if (!inode || !(inode->i_state & I_NEW))
+				break;
 
 			struct simplefs_inode *sfs_inode;
 
 			sfs_inode = simplefs_get_inode(sb, record->inode_no);
 
-			inode = new_inode(sb);
 			inode->i_ino = record->inode_no;
 			inode_init_owner(inode, parent_inode, sfs_inode->mode);
 			inode->i_sb = sb;
 			inode->i_blocks = 1;
-			inode->i_flags |= S_SYNC;
 			inode->i_size = 0;
-
+			inode->i_flags |= S_SYNC;
+			set_nlink(inode, sfs_inode->link_count);
+			printk(KERN_INFO "lookup inode id=%llu, link=%u\n", sfs_inode->inode_no, sfs_inode->link_count);
 			if (S_ISDIR(inode->i_mode))
 			{
 				inode->i_fop = &simplefs_dir_operations;
@@ -1181,6 +1156,7 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 					current_time(inode);
 
 			inode->i_private = sfs_inode;
+			unlock_new_inode(inode);
 			break;
 		}
 
@@ -1277,7 +1253,7 @@ void simplefs_destory_inode(struct inode *inode)
 
 int simplefs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
-	printk(KERN_DEBUG "simplefs_write_inode: %lu\n", inode->i_ino);
+	printk(KERN_DEBUG "simplefs_write_inode: %lu, link=%u\n", inode->i_ino, inode->i_nlink);
 	int err;
 	struct simplefs_inode *sfs_inode;
 
@@ -1290,7 +1266,7 @@ int simplefs_write_inode(struct inode *inode, struct writeback_control *wbc)
 
 	sfs_inode = SIMPLEFS_INODE(inode);
 	sfs_inode->mode = inode->i_mode;
-
+	sfs_inode->link_count = inode->i_nlink;
 	if(S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode))
 		sfs_inode->file_size = inode->i_size;
 	err = simplefs_inode_save(inode->i_sb, sfs_inode);
@@ -1311,6 +1287,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	struct inode *root_inode;
 	struct buffer_head *bh;
 	struct simplefs_super_block *sb_disk;
+	struct simplefs_inode *sfs_inode;
 	int ret = -EPERM;
 
 	printk(KERN_DEBUG "simplefs_fill_super\n");
@@ -1349,6 +1326,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	sb_set_blocksize(sb, SIMPLEFS_DEFAULT_BLOCK_SIZE);
 	sb->s_op = &simplefs_sops;
 
+	sfs_inode = simplefs_get_inode(sb, SIMPLEFS_ROOTDIR_INODE_NUMBER);
 	root_inode = new_inode(sb);
 	root_inode->i_ino = SIMPLEFS_ROOTDIR_INODE_NUMBER;
 	inode_init_owner(root_inode, NULL, S_IFDIR);
@@ -1361,8 +1339,8 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	root_inode->i_blocks = 1;
 	root_inode->i_size = SIMPLEFS_DEFAULT_BLOCK_SIZE;
 	root_inode->i_flags |= S_SYNC;
-	root_inode->i_private =
-	    simplefs_get_inode(sb, SIMPLEFS_ROOTDIR_INODE_NUMBER);
+	root_inode->i_private = sfs_inode;
+	set_nlink(root_inode, sfs_inode->link_count);
 
 	/* TODO: move such stuff into separate header. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 3, 0)

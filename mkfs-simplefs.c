@@ -49,6 +49,7 @@ static int write_inode_store(int fd)
 	root_inode.inode_no = SIMPLEFS_ROOTDIR_INODE_NUMBER;
 	root_inode.data_block_number = SIMPLEFS_ROOTDIR_DATABLOCK_NUMBER;
 	root_inode.dir_children_count = 1;
+	root_inode.link_count = 1;
 
 	ret = write(fd, &root_inode, sizeof(root_inode));
 
@@ -135,6 +136,7 @@ int main(int argc, char *argv[])
 		.inode_no = WELCOMEFILE_INODE_NUMBER,
 		.data_block_number = WELCOMEFILE_DATABLOCK_NUMBER,
 		.file_size = sizeof(welcomefile_body),
+		.link_count = 1,
 	};
 	struct simplefs_dir_record record = {
 		.filename = "vanakkam",
